@@ -1,0 +1,21 @@
+===================================================================
+AWS PIPELINE INFRASTRUCTURE PLAN (TERRAFORM TARGETS)
+===================================================================
+
+[MODULE 1: SECURITY & NETWORK]
+- Custom VPC with private and public subnets
+- Network Access Control Lists (NACLs) & Security Groups
+- AWS Cognito User Pool for client authentication
+
+[MODULE 2: INGESTION TIER]
+- Amazon API Gateway REST endpoints
+- VPC Link for secure internal routing
+- Application Load Balancer (ALB)
+- EC2 Instance cluster hosting the Spring Boot jar
+
+[MODULE 3: DATA PROCESSING & ORCHESTRATION]
+- Amazon S3 Buckets (Raw Data, Cleaned Data, ML Models)
+- AWS Glue Catalog & PySpark ETL Workflow
+- AWS Step Functions State Machine (Orchestrator)
+- AWS SageMaker ML Training & Inference Endpoints
+===================================================================
