@@ -132,3 +132,25 @@ resource "aws_security_group" "ec2_sg" {
     Name = "homework-ec2-sg"
   }
 }
+
+# Generate a random string to ensure a globally unique S3 bucket name
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
+}
+
+# Create the S3 Ingestion Bucket (Homework Step 2)
+resource "aws_s3_bucket" "data_ingestion_bucket" {
+  bucket        = "ml-ingestion-pipeline-bucket-${random_id.bucket_suffix.hex}"
+  force_destroy = true # Allows terraform destroy to clean it up even if it contains data files later
+
+  tags = {
+    Name        = "ml-ingestion-bucket"
+    Environment = "homework"
+  }
+}
+
+# Output the bucket name so we can easily find it for our Spring Boot application
+output "s3_bucket_name" {
+  value       = aws_s3_bucket.data_ingestion_bucket.id
+  description = "The globally unique name of your S3 ingestion bucket"
+}
