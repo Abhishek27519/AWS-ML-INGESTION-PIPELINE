@@ -17,7 +17,7 @@ import java.util.Map;
 public class IngestionController {
 
     // TODO: Paste the exact unique bucket name printed by your Terraform output here!
-    private final String bucketName = "ml-ingestion-pipeline-bucket-e1916285";
+    private final String bucketName = "ml-ingestion-pipeline-bucket-a66b3e5b";
     private final Region awsRegion = Region.US_EAST_1;
 
     @GetMapping("/presigned-url")
