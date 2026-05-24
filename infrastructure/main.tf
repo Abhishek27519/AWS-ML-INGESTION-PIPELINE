@@ -154,3 +154,53 @@ output "s3_bucket_name" {
   value       = aws_s3_bucket.data_ingestion_bucket.id
   description = "The globally unique name of your S3 ingestion bucket"
 }
+
+# 10. IAM Role for AWS Glue Execution Service
+resource "aws_iam_role" "glue_service_role" {
+  name = "homework-glue-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = { Service = "glue.amazonaws.com" }
+      }
+    ]
+  })
+}
+
+# Attach standard managed policy so Glue can write logs and access S3 data
+resource "aws_iam_role_policy_attachment" "glue_service" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+}
+
+# Grant full S3 access to the Glue role so it can crawl your ingestion bucket files
+resource "aws_iam_role_policy_attachment" "glue_s3_access" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+}
+
+# 11. Create an AWS Glue Data Catalog Database
+resource "aws_glue_catalog_database" "ml_pipeline_db" {
+  name        = "ml_pipeline_metadata_db"
+  description = "Holds structural schema definitions for raw and cleaned machine learning datasets"
+}
+
+# 12. Provision an AWS Glue Crawler to automatically discover CSV Schemas
+resource "aws_glue_crawler" "raw_data_crawler" {
+  database_name = aws_glue_catalog_database.ml_pipeline_db.name
+  name          = "homework-raw-data-crawler"
+  role          = aws_iam_role.glue_service_role.arn
+
+  s3_target {
+    path = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/raw-uploads/"
+  }
+
+  tags = {
+
+    Environment = "homework"
+  }
+}
