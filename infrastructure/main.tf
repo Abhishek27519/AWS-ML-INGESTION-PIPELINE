@@ -204,3 +204,101 @@ resource "aws_glue_crawler" "raw_data_crawler" {
     Environment = "homework"
   }
 }
+
+# 13. Upload BOTH PySpark ETL scripts to S3
+resource "aws_s3_object" "upload_job1_script" {
+  bucket = aws_s3_bucket.data_ingestion_bucket.id
+  key    = "scripts/job1_clean.py"
+  source = "../data-pipeline/job1_clean.py"
+  etag   = filemd5("../data-pipeline/job1_clean.py")
+}
+
+resource "aws_s3_object" "upload_job2_script" {
+  bucket = aws_s3_bucket.data_ingestion_bucket.id
+  key    = "scripts/job2_parquet.py"
+  source = "../data-pipeline/job2_parquet.py"
+  etag   = filemd5("../data-pipeline/job2_parquet.py")
+}
+
+# 14. Define both independent Glue Jobs
+resource "aws_glue_job" "glue_job_1" {
+  name     = "homework-glue-job-1-clean"
+  role_arn = aws_iam_role.glue_service_role.arn
+  command {
+    script_location = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/${aws_s3_object.upload_job1_script.key}"
+    python_version  = "3"
+  }
+  default_arguments = {
+    "--INPUT_PATH"         = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/raw-uploads/"
+    "--INTERMEDIATE_PATH"  = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/intermediate-clean/"
+    "--job-language"       = "python"
+  }
+}
+
+resource "aws_glue_job" "glue_job_2" {
+  name     = "homework-glue-job-2-parquet"
+  role_arn = aws_iam_role.glue_service_role.arn
+  command {
+    script_location = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/${aws_s3_object.upload_job2_script.key}"
+    python_version  = "3"
+  }
+  default_arguments = {
+    "--INTERMEDIATE_PATH"  = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/intermediate-clean/"
+    "--OUTPUT_PATH"        = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/cleaned-parquet/"
+    "--job-language"       = "python"
+  }
+}
+
+# 15. IAM Role for AWS Step Functions Orchestration (Kept intact)
+resource "aws_iam_role" "states_execution_role" {
+  name = "homework-stepfunctions-execution-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "states.amazonaws.com" } }]
+  })
+}
+
+resource "aws_iam_role_policy" "states_glue_policy" {
+  name = "stepfunctions-glue-execution-policy"
+  role = aws_iam_role.states_execution_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = ["glue:StartCrawler", "glue:GetCrawler", "glue:StartJobRun", "glue:GetJobRun"], Resource = "*" }]
+  })
+}
+
+# 16. Define the updated State Machine Workflow (Crawler -> Wait -> Job 1 -> Job 2)
+resource "aws_sfn_state_machine" "pipeline_orchestrator" {
+  name     = "ml-pipeline-orchestrator"
+  role_arn = aws_iam_role.states_execution_role.arn
+
+  definition = jsonencode({
+    Comment = "Orchestrates AWS Glue Crawler, Job 1 Cleaning, and Job 2 Parquet conversion sequentially"
+    StartAt = "TriggerCrawler"
+    States = {
+      TriggerCrawler = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:glue:startCrawler"
+        Parameters = { Name = aws_glue_crawler.raw_data_crawler.name }
+        Next = "WaitForCrawlerToFinish"
+      }
+      WaitForCrawlerToFinish = {
+        Type = "Wait"
+        Seconds = 60
+        Next    = "TriggerGlueJob1"
+      }
+      TriggerGlueJob1 = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+        Parameters = { JobName = aws_glue_job.glue_job_1.name }
+        Next     = "TriggerGlueJob2"
+      }
+      TriggerGlueJob2 = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+        Parameters = { JobName = aws_glue_job.glue_job_2.name }
+        End = true
+      }
+    }
+  })
+}
