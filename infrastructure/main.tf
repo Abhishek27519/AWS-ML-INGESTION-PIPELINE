@@ -249,7 +249,7 @@ resource "aws_glue_job" "glue_job_2" {
   }
 }
 
-# 15. IAM Role for AWS Step Functions Orchestration (Kept intact)
+# 15.a IAM Role for AWS Step Functions Orchestration (Kept intact)
 resource "aws_iam_role" "states_execution_role" {
   name = "homework-stepfunctions-execution-role"
   assume_role_policy = jsonencode({
@@ -261,19 +261,105 @@ resource "aws_iam_role" "states_execution_role" {
 resource "aws_iam_role_policy" "states_glue_policy" {
   name = "stepfunctions-glue-execution-policy"
   role = aws_iam_role.states_execution_role.id
+
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = ["glue:StartCrawler", "glue:GetCrawler", "glue:StartJobRun", "glue:GetJobRun"], Resource = "*" }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "glue:StartCrawler",
+          "glue:GetCrawler",
+          "glue:StartJobRun",
+          "glue:GetJobRun"
+        ]
+        Resource = "*"
+      },
+      {
+        # Crucial additions to allow Step Functions to monitor synchronous (.sync) jobs
+        Effect = "Allow"
+        Action = [
+          "events:PutTargets",
+          "events:PutRule",
+          "events:DescribeRule"
+        ]
+        Resource = [
+          "arn:aws:events:*:*:rule/StepFunctionsGetEventsForGlueJobsRule",
+          "arn:aws:events:*:*:rule/StepFunctionsGetEventsForSageMakerTrainingJobsRule"
+        ]
+      }
+    ]
   })
 }
 
-# 16. Define the updated State Machine Workflow (Crawler -> Wait -> Job 1 -> Job 2)
+# 15.b IAM Role for Amazon SageMaker Execution
+resource "aws_iam_role" "sagemaker_execution_role" {
+  name = "homework-sagemaker-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "sagemaker.amazonaws.com" }
+    }]
+  })
+}
+
+# Grant full S3 access to SageMaker so it can pull Parquet training data and save model files
+resource "aws_iam_role_policy_attachment" "sagemaker_s3_access" {
+  role       = aws_iam_role.sagemaker_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+}
+
+# Grant standard SageMaker execution privileges
+resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
+  role       = aws_iam_role.sagemaker_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+}
+
+# Allow Step Functions to invoke SageMaker tasks
+resource "aws_iam_role_policy" "states_sagemaker_policy" {
+  name = "stepfunctions-sagemaker-execution-policy"
+  role = aws_iam_role.states_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:CreateTrainingJob",
+          "sagemaker:DescribeTrainingJob",
+          "sagemaker:CreateModel",
+          "sagemaker:CreateEndpointConfig",
+          "sagemaker:CreateEndpoint",
+          "sagemaker:AddTags"
+        ]
+        Resource = "*"
+      },
+      {
+        # Crucial addition: Allow Step Functions to safely pass the SageMaker role to the compute cluster
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.sagemaker_execution_role.arn
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "sagemaker.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# 16. Define the Complete End-to-End Orchestration Workflow (Glue + SageMaker)
 resource "aws_sfn_state_machine" "pipeline_orchestrator" {
   name     = "ml-pipeline-orchestrator"
   role_arn = aws_iam_role.states_execution_role.arn
 
   definition = jsonencode({
-    Comment = "Orchestrates AWS Glue Crawler, Job 1 Cleaning, and Job 2 Parquet conversion sequentially"
+    Comment = "Orchestrates AWS Glue Data Prep and Amazon SageMaker Model Training/Hosting end-to-end"
     StartAt = "TriggerCrawler"
     States = {
       TriggerCrawler = {
@@ -297,6 +383,83 @@ resource "aws_sfn_state_machine" "pipeline_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = { JobName = aws_glue_job.glue_job_2.name }
+        Next     = "TrainMLModel"
+      }
+      TrainMLModel = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sagemaker:createTrainingJob.sync"
+        Parameters = {
+          # 1. Switched to $$.Execution.Name
+          "TrainingJobName.$" = "States.Format('sensor-training-job-{}', $$.Execution.Name)"
+          AlgorithmSpecification = {
+            TrainingImage     = "382416733822.dkr.ecr.us-east-1.amazonaws.com/linear-learner:1"
+            TrainingInputMode = "File"
+          }
+          HyperParameters = {
+            predictor_type  = "binary_classifier"
+            mini_batch_size = "32"  # Added to prevent crashes on small mock datasets
+          }
+          InputDataConfig = [{
+            ChannelName = "train"
+            ContentType = "text/csv"
+            DataSource = {
+              S3DataSource = {
+                S3DataType = "S3Prefix"
+                # Pointing exactly to the new headerless numerical branch
+                S3Uri      = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/intermediate-clean-sagemaker/"
+              }
+            }
+          }]
+          OutputDataConfig = {
+            S3OutputPath = "s3://${aws_s3_bucket.data_ingestion_bucket.id}/model-artifacts/"
+          }
+          ResourceConfig = {
+            InstanceCount  = 1
+            InstanceType   = "ml.m5.xlarge" # Switched to a standard compute type that usually has a default quota of 1+
+            VolumeSizeInGB = 5
+          }
+          RoleArn = aws_iam_role.sagemaker_execution_role.arn
+          StoppingCondition = { MaxRuntimeInSeconds = 3600 }
+        }
+        Next = "RegisterModelInSageMaker"
+      }
+      RegisterModelInSageMaker = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sagemaker:createModel"
+        Parameters = {
+          # 2. Switched to $$.Execution.Name
+          "ModelName.$" = "States.Format('sensor-predictive-model-{}', $$.Execution.Name)"
+          PrimaryContainer = {
+            Image          = "382416733822.dkr.ecr.us-east-1.amazonaws.com/linear-learner:1"
+            # 3. Switched to $$.Execution.Name
+            "ModelDataUrl.$" = "States.Format('s3://${aws_s3_bucket.data_ingestion_bucket.id}/model-artifacts/sensor-training-job-{}/output/model.tar.gz', $$.Execution.Name)"
+          }
+          ExecutionRoleArn = aws_iam_role.sagemaker_execution_role.arn
+        }
+        Next = "CreateEndpointConfig"
+      }
+      CreateEndpointConfig = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sagemaker:createEndpointConfig"
+        Parameters = {
+          # 4. Switched to $$.Execution.Name
+          "EndpointConfigName.$" = "States.Format('sensor-endpoint-config-{}', $$.Execution.Name)"
+          ProductionVariants = [{
+            InstanceType         = "ml.t2.medium"
+            InitialInstanceCount = 1
+            "ModelName.$"        = "States.Format('sensor-predictive-model-{}', $$.Execution.Name)"
+            VariantName          = "AllTraffic"
+          }]
+        }
+        Next = "DeploySageMakerEndpoint"
+      }
+      DeploySageMakerEndpoint = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sagemaker:createEndpoint"
+        Parameters = {
+          EndpointName           = "sensor-production-endpoint"
+          "EndpointConfigName.$" = "States.Format('sensor-endpoint-config-{}', $$.Execution.Name)"
+        }
         End = true
       }
     }
