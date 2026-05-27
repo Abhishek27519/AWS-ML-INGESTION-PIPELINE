@@ -39,6 +39,13 @@ module "orchestration" {
   job2_name          = module.storage_and_etl.job2_name
 }
 
+module "api_and_compute" {
+  source            = "./modules/api_and_compute"
+  vpc_id            = module.networking.vpc_id
+  private_subnet_id = module.networking.private_subnet_id
+  ec2_sg_id         = module.networking.ec2_sg_id
+}
+
 output "s3_bucket_name" {
   value       = module.storage_and_etl.bucket_id
   description = "The globally unique name of your S3 ingestion bucket"
